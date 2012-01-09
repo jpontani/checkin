@@ -1,0 +1,786 @@
+<?php
+function checkin_menu()
+{
+	$items = array();
+	$base = array(
+		'access callback'		=>	'user_access',
+		'access arguments'	=>	array('administer checkin'),
+	);
+	
+	$items['admin/config/checkin'] 	= $base + array(
+		'title'							=>	'CheckIn Integration',
+		'description'				=>	'Configure the CheckIn Integration settings',
+		'page callback'			=>	'system_admin_menu_block_page',
+		'position'					=>	'right',
+		'weight'						=>	-21,
+		'type'							=>	MENU_NORMAL_ITEM,
+	);
+	
+	$items['admin/config/checkin/settings'] = $base + array(
+		'title'							=>	'CheckIn Settings',
+		'description'				=>	'Configure the CheckIn Integration settings',
+		'page callback'			=>	'drupal_get_form',
+		'page arguments'		=>	array('checkin_settings'),
+		'type'							=>	MENU_NORMAL_ITEM,
+	);
+	
+	$items['admin/config/checkin/resave'] = $base + array(
+		'title'							=>	'Re-Save All GroupEx Classes',
+		'description'				=>	'Runs all nodes through the validation process to update CheckIn system with current data. BE PATIENT, THIS TAKES A LONG TIME!!!',
+		'page callback'			=>	'_checkin_resave_classes',
+		'type'							=>	MENU_NORMAL_ITEM,
+	);
+	
+	return $items;
+}
+
+function checkin_permission()
+{
+	$perm = array(
+		'administer checkin'	=>	array(
+			'title'							=>	t('Administer CheckIn Integration'),
+			'description'				=>	t('Modify CheckIn Integration settings'),
+		),
+	);
+	return $perm;
+}
+
+function checkin_settings()
+{
+	$form['checkin_key'] = array(
+		'#type'							=>	'textfield',
+		'#title'						=>	'Private Key Hash',
+		'#description'			=>	t('Private hash of a key to use for secure authentication of all actions sent to CheckIn'),
+		'#default_value'		=>	variable_get('checkin_key', ''),
+	);
+	$form['checkin_status'] = array(
+		'#type'							=>	'radios',
+		'#title'						=>	'CheckIn Required',
+		'#description'			=>	t('Disable to turn off the requirement for CheckIn system to be pinged before adding/editing/deleting a node'),
+		'#options'					=>	array('y' => 'Yes', 'n' => 'No'),
+		'#default_value'		=>	variable_get('checkin_status', 'n'),
+	);
+	$form['checkin_ping_url'] = array(
+		'#type'							=>	'textfield',
+		'#title'						=>	'URL to see if CheckIn is accepting connections',
+		'#default_value'		=>	variable_get('checkin_ping_url', ''),
+	);
+	$form['checkin_create_url'] = array(
+		'#type'							=>	'textfield',
+		'#title'						=>	'URL for Create Action',
+		'#default_value'		=>	variable_get('checkin_create_url',''),
+	);
+	$form['checkin_update_url'] = array(
+		'#type'							=>	'textfield',
+		'#title'						=>	'URL for Update Action',
+		'#description'			=>	'The # symbol will be replaced with the CheckIn ID Number for the class',
+		'#default_value'		=>	variable_get('checkin_update_url', ''),
+	);
+	$form['checkin_destroy_url'] = array(
+		'#type'							=>	'textfield',
+		'#title'						=>	'URL for Destroy Action',
+		'#description'			=>	'The # symbol will be replaced with the CheckIn ID Number for the class',
+		'#default_value'		=>	variable_get('checkin_destroy_url', ''),
+	);
+	
+	return system_settings_form($form);
+}
+
+function checkin_node_validate($node, $form, &$form_state)
+{
+  $checkIn = variable_get('checkin_status', 'n');
+  $error = FALSE;
+  if ($checkIn == 'y' && isset($form['type']) && $form['type']['#value'] == "groupex_class") {
+    // get CheckIn status and if bad, set error message stating that CheckIn is not available
+    if (!_checkin_status()) {
+      form_set_error('title', 'The CheckIn system is currently not allowing connections. You will be unable to add, edit, or delete GroupEx classes.');
+      $error = TRUE;
+		}
+		else {
+			$isCancelled = false;
+			$cancel = "";
+			$tz = new DateTimeZone("UTC");
+			$start = new DateTime($node->field_date['und'][0]['value'], $tz);
+			$starttime = $start->format('U');
+			$end = new DateTime($node->field_date['und'][0]['value2'], $tz);
+			$endtime = $end->format('U');
+			$classid = (isset($node->field_groupexclass) ? $node->field_groupexclass['und'][0]['nid'] : 0);
+			$instid = (isset($node->field_instructor) ? $node->field_instructor['und'][0]['nid'] : 0);
+			$locid = (isset($node->field_location) ? $node->field_location['und'][0]['tid'] : 0);
+			$roomid = $locid;
+			if ($classid == 0) {
+				form_set_error('field_groupexclass', 'Group Ex Class is required.');
+				$error = TRUE;
+			}
+			if ($instid == 0) {
+				form_set_error('field_instructor', 'Instructor is required.');
+				$error = TRUE;
+			}
+			if ($roomid == 0) {
+				form_set_error('field_location', 'Location/Room is required.');
+				$error = TRUE;
+			}
+			// queries to grab the text versions of the instructor, class, location and room
+			$class = _checkin_get_class($classid);
+			$instructor = _checkin_get_instructor($instid);
+			// location is tough since we have hierarchy in the taxonomy
+			// location is the parent taxonomy term so we need to get parent from the room
+			$location = _checkin_get_location($locid);
+			// room is the actual item we're storing in the field, so just grab it
+			$room = _checkin_get_room($roomid);
+			// set up passes
+			$dpass = array();
+			$passes = $node->field_passes['und'];
+			foreach ($passes as $pass) {
+				$dpass[] = _checkin_get_pass($pass['nid']);
+			}
+			$isCancelled = (intval($node->field_cancelled['und'][0]['value']) == 1 ? true : false);
+			if ($isCancelled) {
+				$cancel = $node->field_cancelcomment['und'][0]['value'];
+			}
+			$data = array(
+				'class'				=>	$class,
+				'location'		=>	$location,
+				'room'				=>	$room,
+				'start'				=>	$starttime,
+				'end'					=>	$endtime,
+				'limit'				=>	(isset($node->field_max_people) ? $node->field_max_people['und']['0']['value'] : 25),
+				'instructor'	=>	$instructor,
+				'passes'			=>	$dpass,
+				'cancel'			=>	$isCancelled,
+				'cancelcom'		=>	$cancel,
+			);
+			if (!$error) {
+				if (is_null($node->nid)) {
+					// new node so send to the CREATE action
+					$result = _checkin_class_create($data);
+					if (isset($node->field_last_class_date['und'][0]['value']) && $node->field_last_class_date['und'][0]['value'] != "") {
+						// only if last class date has a value will we try to insert multiples
+						// otherwise you create a ridiculous amount of extra classes..... OOPS
+						$multiples = _checkin_insert_multiple($node, $data);
+					}
+				}
+				else {
+					// edit node so sent to UPDATE action
+					$data['nid'] = $node->nid;
+					$result = _checkin_class_update($data);
+				}
+				if ((!$result['status'])) {
+					// CheckIn action failed, so don't continue and force them to try again
+					$errors = $result['errors'];
+					for ($i=0; $i<count($errors); $i++) {
+						form_set_error('title', 'CheckIn returned the error: ' . $errors[$i]);
+					}
+				}
+				else
+				{
+					// CheckIn action success, link returned TID to current NID
+					$_SESSION['checkin_id_orig'] = $result['cid'];
+				}
+				if (isset($multiples) && !$multiples['status']) {
+					$errors = $multiples['errors'];
+					foreach ($errors as $error) {
+						drupal_set_message("CheckIn returned the error: " . $error);
+					}
+				}
+			}
+			else {
+				// didn't try to post
+			}
+		}
+	}
+}
+
+function checkin_node_insert($node)
+{
+	$checkIn = variable_get('checkin_status', 'n');
+	if($checkIn == 'y' && $node->type == 'groupex_class')
+	{
+		if(isset($node->cid))
+		{
+			_checkin_id_table($node->nid, $node->cid);
+		}
+		else
+		{
+			_checkin_id_table($node->nid, $_SESSION['checkin_id_orig']);
+			$_SESSION['checkin_id_orig'] = 0;
+		}
+	}
+}
+
+function checkin_node_delete($node)
+{
+	global $user;
+	$checkIn = variable_get('checkin_status', 'n');
+	if($checkIn == 'y' && $node->type == 'groupex_class')
+	{
+		$return = _checkin_class_destroy(array( 'nid' => $node->nid ));
+		if($return['status'])
+		{
+			$cid = _checkin_table_lookup($node->nid);
+			_checkin_remove_id($node->nid);
+		}
+		else
+		{
+			drupal_set_message($return['errors'][0], 'error');
+			drupal_goto('/node/' . $node->nid . '/edit');
+		}
+	}
+}
+
+function checkin_form_alter(&$form, &$form_state, $form_id)
+{
+	if(isset($form['type']) && isset($form['type']['#value']) && $form['type']['#value'] == "groupex_class")
+	{
+		$form['workbench_access_id']['#default_value'] = 3;
+	}
+	$checkIn = variable_get('checkin_status', 'n');
+	if($checkIn == 'y' && isset($form['type']) && $form['type']['#value'] == "groupex_class")
+	{
+		// make sure this is only for gex class node, that the flag is set, and that it is set to FALSE
+		// if all this is is true, then we want to prevent the form from being used
+		if(!_checkin_status())
+		{
+			// CheckIn status, if false, cannot add/update/delete GEX classes/passes
+			// disable all action buttons on the NODE ADD/EDIT form
+			// this won't prevent them from actually submitting if they know how to cheat it
+			drupal_set_message('The CheckIn system is currently not allowing connections. You will be unable to add, edit, or delete GroupEx classes.', 'error', false);
+			if(isset($form['actions']))
+			{
+				if(isset($form['actions']['submit']))
+				{
+					$form['actions']['submit']['#disabled'] = true;
+				}
+				if(isset($form['actions']['preview']))
+				{
+					$form['actions']['preview']['#disabled'] = true;
+				}
+				if(isset($form['actions']['delete']))
+				{
+					$form['actions']['delete']['#disabled'] = true;
+				}
+			}
+		}
+	}
+}
+// helper function, creates a new CURL class for use in action controllers
+// helps minimize code redundancy and increases consistency among controllers
+function _checkin_class_curl($url, $type)
+{
+	$curl = curl_init();
+	$curl_options = array(
+		CURLOPT_URL							=>	$url,
+		CURLOPT_FRESH_CONNECT		=>	false,
+		CURLOPT_HEADER					=>	false,
+		CURLOPT_RETURNTRANSFER	=>	true,
+		CURLOPT_SSL_VERIFYPEER	=>	false,
+	);
+	curl_setopt_array($curl, $curl_options);
+	return $curl;
+}
+// our CREATE action, formats the XML and posts to the proper url
+function _checkin_class_create($info)
+{
+  watchdog('checkin', 'XML CREATE<br /><pre>' . serialize($info) . '</pre>');
+	$returnArray = array();
+	$hash = variable_get('checkin_key', '');
+	if($hash == '')
+	{
+		$returnArray['status'] = false;
+		$returnArray['errors'][] = 'CheckIn secure hash key not configured. Please contact the administrator.';
+		return $returnArray;
+	}
+	$url = variable_get('checkin_create_url', '');
+	if($url == '')
+	{
+		// blank URL, need to trigger a bad config
+		$returnArray['status'] = false;
+		$returnArray['errors'][] = 'The CheckIn URL was not configured properly. Please contact the site administrator to correct this issue.';
+		return $returnArray;
+	}
+	$start = date('Y\-m\-d\TH\:i\:sP', $info['start']); //2011-03-30T15:44:00-04:00
+	$end = date('Y\-m\-d\TH\:i\:sP', $info['end']); //2011-03-30T16:44:00-04:00
+	$limit = $info['limit'];
+	$inst = $info['instructor'];
+	$loc = $info['location'];
+	$room = $info['room'];
+	$class = $info['class'];
+	$curl_create = _checkin_class_curl($url . "?key=$hash", 'post');
+	$p = $info['passes'];
+	$passes = "";
+	foreach($p as $pass)
+	{
+		$passes .= "<pass type='string'>" . htmlentities($pass) . "</pass>";
+	}
+	$xml = "<fitness-class><id type='integer'>124953903</id><passes type='array'>$passes</passes><cancellation-comment /><cancelled type='boolean'>false</cancelled><ends-at type='datetime'>$end</ends-at><limit type='integer'>$limit</limit><name>$class</name><starts-at type='datetime'>$start</starts-at><location-name>$loc</location-name><instructor-name>$inst</instructor-name><classroom>$room</classroom></fitness-class>";
+	curl_setopt($curl_create, CURLOPT_POST, true);
+	curl_setopt($curl_create, CURLOPT_POSTFIELDS, $xml);
+	curl_setopt($curl_create, CURLOPT_HTTPHEADER, array('Content-Type: application/xml'));
+	$response = curl_exec($curl_create);
+	curl_close($curl_create);
+	$xmlRead = new DOMDocument();
+	_checkin_fix_response($response);
+	$xmlRead->loadXML($response);
+	$errors = $xmlRead->getElementsByTagName('error');
+	if($errors->length > 0)
+	{
+		foreach($errors as $error)
+		{
+			$returnArray['errors'][] = $error->nodeValue;
+		}
+		$returnArray['status'] = false;
+	}
+	else
+	{
+		$returnArray['cid'] = $xmlRead->getElementsByTagName('id')->item(0)->nodeValue;
+		$returnArray['status'] = true;
+	}
+	return $returnArray;
+}
+
+// our UPDATE action, formats the XML and posts to the proper url
+function _checkin_class_update($info)
+{
+	$returnArray = array();
+	$hash = variable_get('checkin_key', '');
+	if($hash == '')
+	{
+		$returnArray['status'] = false;
+		$returnArray['errors'][] = 'CheckIn secure hash key not configured. Please contact the administrator.';
+		return $returnArray;
+	}
+	$url = variable_get('checkin_update_url', '');
+	if($url == '')
+	{
+		// blank URL, need to trigger a bad config
+		$returnArray['status'] = false;
+		$returnArray['errors'][] = 'The CheckIn URL was not configured properly. Please contact the site administrator to correct this issue.';
+		return $returnArray;
+	}
+	$cid = 0;
+	$nid = $info['nid'];
+	$cidq = db_select('checkin_lookup', 'c')->fields('c')->condition('nid', $nid)->execute()->fetchAssoc();
+	$cid = $cidq['cid'];
+	if($cid == 0 || $nid == 0)
+	{
+		$returnArray['status'] = false;
+		$returnArray['errors'][] = 'Could not find the CheckIn ID number in the lookup table for the specified Node ID.';
+		return $returnArray;
+	}
+	$url = str_replace('#', $cid, $url) . "?key=$hash";
+	$start = date('Y\-m\-d\TH\:i\:sP', $info['start']); //2011-03-30T15:44:00-04:00
+	$end = date('Y\-m\-d\TH\:i\:sP', $info['end']); //2011-03-30T16:44:00-04:00
+	$limit = $info['limit'];
+	$inst = $info['instructor'];
+	$loc = $info['location'];
+	$room = $info['room'];
+	$class = $info['class'];
+	$curl_update = _checkin_class_curl($url, 'put');
+	$p = $info['passes'];
+	$passes = "";
+	foreach($p as $pass)
+	{
+		$passes .= "<pass type='string'>" . htmlentities($pass) . "</pass>";
+	}
+	$isCancelled = $info['cancel'];
+	$cancelcom = $info['cancelcom'];
+	$xml = "<fitness-class><id type='integer'>$cid</id><passes type='array'>$passes</passes><cancellation-comment>$cancelcom</cancellation-comment><cancelled type='boolean'>$isCancelled</cancelled><ends-at type='datetime'>$end</ends-at><limit type='integer'>$limit</limit><name>$class</name><starts-at type='datetime'>$start</starts-at><location-name>$loc</location-name><instructor-name>$inst</instructor-name><classroom>$room</classroom></fitness-class>";
+	curl_setopt($curl_update, CURLOPT_POST, true);
+	curl_setopt($curl_update, CURLOPT_POSTFIELDS, $xml);
+	curl_setopt($curl_update, CURLOPT_HTTPHEADER, array('Content-Type: application/xml'));
+	$response = curl_exec($curl_update);
+	curl_close($curl_update);
+	$xmlRead = new DOMDocument();
+	_checkin_fix_response($response);
+	$xmlRead->loadXML($response);
+	// watchdog('checkin','UPDATE CURL RESPONSE : <textarea rows=10 cols=50>' . $response . '</textarea>', null, WATCHDOG_DEBUG);
+	$errors = $xmlRead->getElementsByTagName('error');
+	if($errors->length > 0)
+	{
+		foreach($errors as $error)
+		{
+			$returnArray['errors'][] = $error->nodeValue;
+		}
+		$returnArray['status'] = false;
+	}
+	else
+	{
+		$returnArray['cid'] = $xmlRead->getElementsByTagName('id')->item(0)->nodeValue;
+		$returnArray['status'] = true;
+	}
+	return $returnArray;
+}
+
+// our DESTROY action, formats the XML and posts to the proper url
+function _checkin_class_destroy($info)
+{
+	$returnArray = array();
+	$hash = variable_get('checkin_key', '');
+	if($hash == '')
+	{
+		$returnArray['status'] = false;
+		$returnArray['errors'][] = 'CheckIn secure hash key not configured. Please contact the administrator.';
+		return $returnArray;
+	}
+	$url = variable_get('checkin_destroy_url', '');
+	if($url == '')
+	{
+		// blank URL, need to trigger a bad config
+		$returnArray['status'] = false;
+		$returnArray['errors'][] = 'The CheckIn URL was not configured properly. Please contact the site administrator to correct this issue.';
+		return $returnArray;
+	}
+	$cid = 0;
+	$nid = $info['nid'];
+	$cidq = db_select('checkin_lookup', 'c')->fields('c')->condition('nid', $nid)->execute()->fetchAssoc();
+	$cid = $cidq['cid'];
+	if($cid == 0 || $nid == 0)
+	{
+		$returnArray['status'] = false;
+		$returnArray['errors'][] = 'Could not find the CheckIn ID number in the lookup table for the specified Node ID.';
+		return $returnArray;
+	}
+	$url = str_replace('#', $cid, $url) . "?key=$hash";
+	$curl_delete = _checkin_class_curl($url, 'delete');
+	curl_setopt($curl_delete, CURLOPT_CUSTOMREQUEST, 'DELETE');
+	$response = curl_exec($curl_delete);
+	curl_close($curl_delete);
+	if($response != "Success")
+	{
+		$returnArray['errors'][] = "CheckIn was unable to delete the class. Please try again or contact the administrator.";
+		$returnArray['status'] = false;
+	}
+	else
+	{
+		$returnArray['status'] = true;
+	}
+	return $returnArray;
+}
+
+function _checkin_status()
+{
+	$status = false;
+	$hash = variable_get('checkin_key', '');
+	if($hash == '')
+	{
+		return false;
+	}
+	// run status check on server to make sure checkin is accepting connections
+	// if so, then continue on to the form, otherwise we need to show an error stating that
+	// checkin will not be updated and prevent the user from continuing their edit
+	$ping_url = variable_get('checkin_ping_url', '');
+	if($ping_url == '')
+	{
+		// no URL configured, force set (just in case) $checkInOk as false
+		$status = false;
+	}
+	else
+	{
+		// URL configured, start a CURL check
+		$curl_ping = curl_init();
+		$curl_options = array(
+			CURLOPT_URL							=>	$ping_url . "?key=" . $hash,
+			CURLOPT_FRESH_CONNECT		=>	false,
+			CURLOPT_HEADER					=>	false,
+			CURLOPT_RETURNTRANSFER	=>	true,
+			CURLOPT_SSL_VERIFYPEER	=>	false,
+		);
+		curl_setopt_array($curl_ping, $curl_options);
+		$result = curl_exec($curl_ping);
+		if(curl_errno($curl_ping))
+		{
+			// something went wrong with the request
+			$status = false;
+			watchdog('checkin', 'PING: ' . curl_error($curl_ping), null, WATCHDOG_ALERT);
+		}
+		else
+		{
+			// request was fine, but check the response to make sure CheckIn is allowing changes
+			if(substr($result, 0, 38) == '<?xml version="1.0" encoding="UTF-8"?>')
+			{
+				$status = true;
+			}
+		}
+		curl_close($curl_ping);
+	}
+	$st = ($status ? 'true' : 'false');
+	return $status;
+}
+
+function _checkin_fix_response(&$resp)
+{
+	$resp = str_replace('&mdash;', '--', $resp);
+	$resp = str_replace('&copy;', '(C)', $resp);
+}
+
+function _checkin_page_test()
+{
+	$tz = new DateTimeZone("UTC");
+	$start = new DateTime('now', $tz);
+	$starttime = $start->format('U');
+	$end = new DateTime('now +1 hour', $tz);
+	$endtime = $end->format('U');
+	$status = _checkin_status();
+	$passes = array('Summer Session I & II - War Pass - $15.00');
+	$data = array(
+		'class'				=>	'BODYPUMP(TM)',
+		'location'		=>	'McComas Hall',
+		'room'				=>	'Studio A',
+		'start'				=>	$starttime,
+		'end'					=>	$endtime,
+		'limit'				=>	25,
+		'instructor'	=>	'Ali Cross',
+		'passes'			=>	$passes,
+		);
+	$result = serialize(_checkin_class_create($data));
+	$st = ($status ? 'true' : 'false');
+	return "<strong>CheckIn Status:</strong> $st<br><strong>Create Result:</strong><textarea rows=10 cols=80>$result</textarea>";
+}
+
+function _checkin_logout()
+{
+	$curl_ping = curl_init();
+	$curl_options = array(
+		CURLOPT_URL							=>	"http://128.173.129.1:4001/logout",
+		CURLOPT_FRESH_CONNECT		=>	true,
+		CURLOPT_HEADER					=>	false,
+		CURLOPT_RETURNTRANSFER	=>	true,
+	);
+	curl_setopt_array($curl_ping, $curl_options);
+	$result = curl_exec($curl_ping);
+	curl_close($curl_ping);
+	return $result;
+}
+
+function _checkin_get_class($classid)
+{
+	$classq = db_select('node', 'n')->fields('n', array('title'))->condition('nid', $classid)->execute()->fetchAssoc();
+	return $classq['title'];
+}
+
+function _checkin_get_instructor($instid)
+{
+	$instq = db_select('node', 'n')->fields('n', array('title'))->condition('nid', $instid)->execute()->fetchAssoc();
+	return $instq['title'];
+}
+
+function _checkin_get_location($locid)
+{
+	$locq = db_select('taxonomy_term_hierarchy', 't')->fields('t', array('parent'))->condition('tid', $locid)->execute()->fetchAssoc();
+	$loc1 = $locq['parent'];
+	$locpq = db_select('taxonomy_term_data', 't')->fields('t', array('name'))->condition('tid', $loc1)->execute()->fetchAssoc();
+	return $locpq['name'];
+}
+
+function _checkin_get_room($roomid)
+{
+	$roomq = db_select('taxonomy_term_data', 't')->fields('t', array('name'))->condition('tid', $roomid)->execute()->fetchAssoc();
+	return $roomq['name'];
+}
+
+function _checkin_get_pass($passid)
+{
+	$passq = db_select('node', 'n')->fields('n', array('title'))->fields('c', array('field_cost_value'))->condition('nid', $passid);
+	$passq->leftJoin('field_data_field_cost', 'c', 'n.nid=c.entity_id');
+	$passq = $passq->execute()->fetchAssoc();
+	//return $passq['title'] . " - $" . number_format(floatVal($passq['field_cost_value']), 2, '.', '');
+	return $passq['title'] . " - $" . _checkin_pass_value($passq['field_cost_value']);
+}
+
+function _checkin_pass_value($value)
+{
+  $dec = strpos($value, ".");
+  if($dec) {
+    return number_format(floatVal($value), 2, '.', '');
+  }
+  return $value;
+}
+
+function _checkin_table_lookup($nodeid)
+{
+	$q = db_select('checkin_lookup', 'c')->fields('c', array('cid'))->condition('c.nid', $nodeid)->execute()->fetchCol();
+	return $q[0];
+}
+
+function _checkin_id_table($nodeid, $cid)
+{
+	db_insert('checkin_lookup')->fields(array('nid' => $nodeid, 'cid' => $cid))->execute();
+}
+
+function _checkin_remove_id($nodeid)
+{
+	db_delete('checkin_lookup')->condition('nid', $nodeid)->execute();
+}
+
+function _checkin_date_only($date)
+{
+	$tz = new DateTimeZone("UTC");
+	return $date->format("Y-m-d");
+}
+
+function _checkin_insert_multiple($node, $data)
+{
+	$count = 0;
+	$return = array('errors' => array(), 'cids' => array(), 'status' => false);
+	$result = array('status' => false);
+	$tz = new DateTimeZone("UTC");
+	$oneday = new DateInterval("P1D");
+	$sevendays = new DateInterval("P7D");
+	$repeatUntil = new DateTime($node->field_last_class_date['und'][0]['value'], $tz);
+	$repeatUntil->add($oneday);
+	$startdate = new DateTime($node->field_date['und'][0]['value'], $tz);
+	$startdate->add($sevendays);
+	$enddate = new DateTime($node->field_date['und'][0]['value2'], $tz);
+	$enddate->add($sevendays);
+	while(_checkin_date_only($startdate) <= _checkin_date_only($repeatUntil))
+	{
+		// add new node stuff here		
+		$newNode = new stdClass();
+		$newNode->type = $node->type;
+		$newNode->status = $node->status;
+		$newNode->menu = $node->menu;
+		$newNode->language = $node->language;
+		$newNode->title = $node->title;
+		$newNode->uid = $node->uid;
+		$newNode->comment = $node->comment;
+		$newNode->promote = $node->promote;
+		$newNode->sticky = $node->sticky;
+		$newNode->field_groupexclass = $node->field_groupexclass;
+		$newNode->field_category = $node->field_category;
+		$newNode->field_passes = $node->field_passes;
+		$newNode->field_instructor = $node->field_instructor;
+		$newNode->field_location = $node->field_location;
+		$newNode->field_max_people = $node->field_max_people;
+		$newNode->body = $node->body;
+		$newNode->field_cancelled = $node->field_cancelled;
+		$newNode->field_cancelcomment = $node->field_cancelcomment;
+		$dstr = $startdate->format('c');
+		$dstr = substr($dstr, 0, -6);
+		$dstr = str_replace('T', ' ', $dstr);
+		$dend = $enddate->format('c');
+		$dend = substr($dend, 0, -6);
+		$dend = str_replace('T', ' ', $dend);
+		$newNode->field_date['und'][0]['value'] = $dstr;
+		$newNode->field_date['und'][0]['value2'] = $dend;
+		$starttime = $startdate->format("U");
+		$endtime = $enddate->format("U");
+		$data['start'] = $starttime;
+		$data['end'] = $endtime;
+		$result = _checkin_class_create($data);
+		if($result['status'])
+		{
+			// no errors
+			$newNode->cid = $result['cid'];
+			node_save($newNode);
+			$link = array();
+			$link['link_path'] = "node/" . $newNode->nid;
+			$link['link_title'] = $newNode->title;
+			$link['menu_name'] = "main-menu";
+			$link['plid'] = 2829;
+			menu_link_save($link);
+			$return['cids'][$newNode->nid] = $result['cid'];
+			$record = array(
+	      'nid' => $newNode->nid,
+	      'access_id' => 3,
+	      'access_scheme' => 'taxonomy',
+	    );
+      drupal_write_record('workbench_access_node', $record);
+		}
+		else
+		{
+			// errors
+			foreach($result['errors'] as $error)
+			{
+				$return['errors'][] = $error;
+			}
+		}
+		// add seven more days for the next week
+		$startdate->add($sevendays);
+		$enddate->add($sevendays);
+		$count++;
+		if($startdate > $repeatUntil)
+		{
+			break;
+		}
+	}
+	return $return;
+}
+
+function _checkin_resave_classes()
+{
+	$errors = array();
+  $classquery = new EntityFieldQuery();
+
+  $entities = $classquery->entityCondition('entity_type','node')->entityCondition('bundle', 'groupex_class')->execute();
+
+  $fakeform = array('type' => array('#value' => 'groupex_class'));
+  $fakeformstate = array();
+
+  $nodes = node_load_multiple(array_keys($entities['node']));
+
+  foreach ($nodes as $nid => $node) {
+    $isCancelled = false;
+		$cancel = "";
+		$tz = new DateTimeZone("UTC");
+		$start = new DateTime($node->field_date['und'][0]['value'], $tz);
+		$starttime = $start->format('U');
+		$end = new DateTime($node->field_date['und'][0]['value2'], $tz);
+		$endtime = $end->format('U');
+		$classid = (isset($node->field_groupexclass) ? $node->field_groupexclass['und'][0]['nid'] : 0);
+		$instid = (isset($node->field_instructor) ? $node->field_instructor['und'][0]['nid'] : 0);
+		$locid = (isset($node->field_location) ? $node->field_location['und'][0]['tid'] : 0);
+		$roomid = $locid;
+		if ($classid == 0 && $instid == 0 && $roomid == 0) {
+			// queries to grab the text versions of the instructor, class, location and room
+			$class = _checkin_get_class($classid);
+			$instructor = _checkin_get_instructor($instid);
+			// location is tough since we have hierarchy in the taxonomy
+			// location is the parent taxonomy term so we need to get parent from the room
+			$location = _checkin_get_location($locid);
+			// room is the actual item we're storing in the field, so just grab it
+			$room = _checkin_get_room($roomid);
+			// set up passes
+			$dpass = array();
+			$passes = $node->field_passes['und'];
+			foreach ($passes as $pass) {
+				$dpass[] = _checkin_get_pass($pass['nid']);
+			}
+			$isCancelled = (intval($node->field_cancelled['und'][0]['value']) == 1 ? true : false);
+			if ($isCancelled) {
+				$cancel = $node->field_cancelcomment['und'][0]['value'];
+			}
+			$data = array(
+				'class'				=>	$class,
+				'location'		=>	$location,
+				'room'				=>	$room,
+				'start'				=>	$starttime,
+				'end'					=>	$endtime,
+				'limit'				=>	(isset($node->field_max_people) ? $node->field_max_people['und']['0']['value'] : 25),
+				'instructor'	=>	$instructor,
+				'passes'			=>	$dpass,
+				'cancel'			=>	$isCancelled,
+				'cancelcom'		=>	$cancel,
+				'nid'         =>  $node->nid,
+			);
+			$result = _checkin_class_update($data);
+			if ((!$result['status'])) {
+				// CheckIn action failed, so don't continue and force them to try again
+				$errors += $result['errors'];
+			}
+		}
+		else {
+			$errors[] = "Node #" . $node->nid . " was not sync'd.";
+		}
+  }
+
+  if (empty($errors)) {
+    return "All GroupEx classes have been sync'd";
+  }
+  else {
+    $msg = "The following errors were returned";
+    foreach($errors as $error) {
+      $msg .= "<br>$error";
+    }
+    return $msg;
+  }
+}

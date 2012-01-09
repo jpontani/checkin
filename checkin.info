@@ -1,0 +1,6 @@
+; $Id$
+name = CheckIn Push Notification
+description = "Sends push notifications to CheckIn system when new GEX classes and passes are made or updated."
+core = 7.x
+files[] = checkin.module
+package = VT Rec Sports
